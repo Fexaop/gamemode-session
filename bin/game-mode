@@ -1,0 +1,755 @@
+#!/usr/bin/env python3
+"""Game Mode control backend.
+
+This script is the single source of truth for switching between:
+  * Desktop: niri on the desktop VT, game session optionally paused
+  * Game:    gamescope + Steam Big Picture on tty2 with NVIDIA + HDR
+
+The GTK front end, niri keybind, and xbindkeys all call this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (HOME / ".config")) / "game-mode"
+GUI_CONFIG = CONFIG_DIR / "gui.json"
+POWER_PROFILE_FILE = CONFIG_DIR / "power-profile"
+NIRI_VT_FILE = RUNTIME / "game-mode.niri-vt"
+GAME_MODE_FLAG = RUNTIME / "niri-game-mode"
+ACTIVE_VT_FILE = Path("/sys/class/tty/tty0/active")
+BACKLIGHT_DIR = Path("/sys/class/backlight/amdgpu_bl1")
+BRIGHTNESS_STEP_PERCENT = 5
+
+GAME_SERVICE = "gamescope-tty2.service"
+PERF_SERVICE = "game-mode-perf.service"
+RETURN_SERVICE = "game-mode-return.service"
+STOP_SERVICE = "game-mode-stop.service"
+FOCUS_TEMPLATE = "game-mode-focus@{}.service"
+
+GAME_VT = 2
+FALLBACK_NIRI_VT = 4
+POWER_PROFILES = ("balanced", "boost", "burn")
+DEFAULT_POWER_PROFILE = "boost"
+POWER_LABELS = {
+    "balanced": "Balanced",
+    "boost": "Boost",
+    "burn": "Burn PC",
+}
+
+
+def run(cmd: list[str], timeout: float = 10) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+
+
+def systemctl(*args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    return run(["systemctl", *args], timeout=timeout)
+
+
+def is_active(unit: str) -> bool:
+    return systemctl("is-active", "--quiet", unit, timeout=5).returncode == 0
+
+
+def notify(title: str, body: str) -> None:
+    if shutil.which("notify-send"):
+        run(["notify-send", "-a", "Game Mode", title, body], timeout=4)
+
+
+def niri_vt() -> int:
+    """Find the desktop VT without ever returning the game VT."""
+    env_vt = os.environ.get("XDG_VTNR", "")
+    if env_vt.isdigit() and int(env_vt) != GAME_VT:
+        return int(env_vt)
+
+    if NIRI_VT_FILE.exists():
+        try:
+            value = int(NIRI_VT_FILE.read_text(encoding="utf-8").strip())
+            if value != GAME_VT:
+                return value
+        except (OSError, ValueError):
+            pass
+
+    session_id = os.environ.get("XDG_SESSION_ID")
+    if session_id:
+        proc = run(
+            ["loginctl", "show-session", session_id, "-p", "VTNr", "--value"],
+            timeout=3,
+        )
+        if proc.returncode == 0 and proc.stdout.strip().isdigit():
+            value = int(proc.stdout.strip())
+            if value != GAME_VT:
+                return value
+
+    return FALLBACK_NIRI_VT
+
+
+def remember_niri_vt() -> None:
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        NIRI_VT_FILE.write_text(f"{niri_vt()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def active_vt() -> int | None:
+    """Return the VT currently displayed by the kernel, if it is readable."""
+    try:
+        name = ACTIVE_VT_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    match = re.fullmatch(r"tty(\d+)", name)
+    return int(match.group(1)) if match else None
+
+
+def read_text(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return "?"
+
+
+def service_state(unit: str) -> dict[str, str]:
+    proc = systemctl(
+        "show",
+        unit,
+        "-p",
+        "ActiveState",
+        "-p",
+        "SubState",
+        "-p",
+        "Result",
+        "--value",
+        timeout=5,
+    )
+    if proc.returncode != 0:
+        return {}
+    values = proc.stdout.strip().splitlines()
+    if len(values) < 3:
+        return {}
+    return {
+        "active_state": values[0].strip(),
+        "sub_state": values[1].strip(),
+        "result": values[2].strip(),
+    }
+
+
+def game_service_stable(settle: float = 1.8) -> bool:
+    """Catch a Type=simple service that starts and then crashes immediately."""
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        state = service_state(GAME_SERVICE)
+        if state.get("active_state") == "failed":
+            return False
+        if state.get("result") not in (None, "", "success"):
+            return False
+        if (
+            state.get("active_state") == "active"
+            and state.get("sub_state") == "running"
+        ):
+            time.sleep(settle)
+            state = service_state(GAME_SERVICE)
+            return (
+                state.get("active_state") == "active"
+                and state.get("sub_state") == "running"
+                and state.get("result") in (None, "", "success")
+            )
+        time.sleep(0.25)
+    return False
+
+
+def service_log_tail(unit: str, lines: int = 8) -> str:
+    proc = run(
+        ["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"],
+        timeout=6,
+    )
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+def read_power_profile() -> str:
+    try:
+        profile = POWER_PROFILE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return DEFAULT_POWER_PROFILE
+    return profile if profile in POWER_PROFILES else DEFAULT_POWER_PROFILE
+
+
+def set_power_profile(profile: str) -> int:
+    """Save a game-only power profile and apply it if tty2 is in the foreground."""
+    if profile not in POWER_PROFILES:
+        notify("Invalid power profile", profile)
+        return 2
+
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = POWER_PROFILE_FILE.with_suffix(".tmp")
+        tmp.write_text(f"{profile}\n", encoding="utf-8")
+        tmp.replace(POWER_PROFILE_FILE)
+    except OSError as exc:
+        notify("Could not save power profile", str(exc))
+        return 1
+
+    label = POWER_LABELS[profile]
+    if is_active(GAME_SERVICE) and active_vt() == GAME_VT:
+        proc = systemctl("restart", PERF_SERVICE, timeout=90)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "systemctl restart failed").strip()
+            notify("Power profile failed", detail[-500:])
+            return proc.returncode or 1
+        notify("Game power profile", f"{label} applied")
+        return 0
+
+    notify("Game power profile", f"{label} saved for the next game launch")
+    return 0
+
+
+def brightness_state() -> dict:
+    try:
+        current = int((BACKLIGHT_DIR / "brightness").read_text(encoding="utf-8").strip())
+        maximum = int(
+            (BACKLIGHT_DIR / "max_brightness").read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        return {"available": False}
+    if maximum <= 0:
+        return {"available": False}
+    return {
+        "available": True,
+        "raw": current,
+        "max": maximum,
+        "percent": round(current * 100 / maximum),
+    }
+
+
+def adjust_brightness(direction: int) -> int:
+    state = brightness_state()
+    if not state.get("available"):
+        notify("Brightness unavailable", "The amdgpu_bl1 backlight was not found.")
+        return 1
+
+    maximum = int(state["max"])
+    step = max(1, maximum * BRIGHTNESS_STEP_PERCENT // 100)
+    minimum = max(1, maximum // 100)
+    current = int(state["raw"])
+    target = min(maximum, max(minimum, current + direction * step))
+
+    try:
+        (BACKLIGHT_DIR / "brightness").write_text(f"{target}\n", encoding="utf-8")
+    except OSError as exc:
+        notify("Brightness change failed", str(exc))
+        return 1
+
+    percent = round(target * 100 / maximum)
+    print(f"{percent}%")
+    return 0
+
+
+def process_running(name: str) -> bool:
+    return (
+        run(["pgrep", "-u", str(os.getuid()), "-x", name], timeout=2).returncode == 0
+    )
+
+
+def steam_running() -> bool:
+    return process_running("steam") or process_running("steamwebhelper")
+
+
+def shutdown_steam() -> bool:
+    if not steam_running():
+        return True
+
+    steam = shutil.which("steam")
+    if steam:
+        run([steam, "-shutdown"], timeout=15)
+
+    for _ in range(30):
+        if not steam_running():
+            return True
+        time.sleep(0.5)
+
+    return not steam_running()
+
+
+def focus_vt(vt: int) -> bool:
+    return (
+        systemctl("start", FOCUS_TEMPLATE.format(vt), timeout=30).returncode == 0
+    )
+
+
+def start_game(autostart: bool = False) -> int:
+    remember_niri_vt()
+
+    if is_active(GAME_SERVICE):
+        if not focus_vt(GAME_VT):
+            notify("Game mode failed", "Could not switch to tty2.")
+            return 1
+        proc = systemctl("restart", PERF_SERVICE, timeout=90)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "systemctl restart failed").strip()
+            notify("Power profile failed", detail[-500:])
+            return proc.returncode or 1
+        return 0
+
+    if not autostart and not shutdown_steam():
+        notify(
+            "Steam is still running",
+            "Close Steam on the desktop before starting Big Picture.",
+        )
+        return 1
+
+    # gamescope's libinput backend sees no devices if it starts on an inactive
+    # VT.  Switch first, then give the VT a moment to become current.
+    if not focus_vt(GAME_VT):
+        notify("Game mode failed", "Could not switch to tty2.")
+        return 1
+    for _ in range(20):
+        if active_vt() == GAME_VT:
+            break
+        time.sleep(0.1)
+    time.sleep(0.5)
+
+    proc = systemctl("start", GAME_SERVICE, timeout=90)
+    if proc.returncode != 0 or not game_service_stable():
+        tail = service_log_tail(GAME_SERVICE)
+        detail = (proc.stderr or proc.stdout or "gamescope did not stay running").strip()
+        if tail:
+            detail = f"{detail}\n{tail}"
+        systemctl("stop", GAME_SERVICE, timeout=30)
+        systemctl("stop", PERF_SERVICE, timeout=30)
+        focus_vt(niri_vt())
+        notify("Game mode failed", detail[-700:])
+        return 1
+
+    proc = systemctl("restart", PERF_SERVICE, timeout=90)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "systemctl restart failed").strip()
+        notify("Game started without power profile", detail[-500:])
+        return proc.returncode or 1
+
+    return 0
+
+
+def pause_desktop() -> int:
+    """Return to niri, stop clock locks, keep gamescope/Steam alive."""
+    remember_niri_vt()
+
+    proc = systemctl("start", RETURN_SERVICE, timeout=30)
+    if proc.returncode == 0:
+        return 0
+
+    # Fallback for a partially installed setup.
+    systemctl("stop", PERF_SERVICE, timeout=30)
+    focus_vt(niri_vt())
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if detail:
+        notify("Game mode return failed", detail[-500:])
+    return proc.returncode or 1
+
+
+def quit_game() -> int:
+    """Stop gamescope/Steam, restore clocks, release NVIDIA, return to niri."""
+    remember_niri_vt()
+
+    proc = systemctl("start", STOP_SERVICE, timeout=60)
+    if proc.returncode == 0:
+        return 0
+
+    systemctl("stop", GAME_SERVICE, timeout=60)
+    systemctl("stop", PERF_SERVICE, timeout=30)
+    focus_vt(niri_vt())
+
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if detail:
+        notify("Game mode stop failed", detail[-500:])
+    return proc.returncode or 1
+
+
+def query_nvidia() -> dict:
+    if not shutil.which("nvidia-smi"):
+        return {}
+
+    proc = run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,clocks.current.graphics,clocks.current.memory,"
+            "clocks.max.graphics,clocks.max.memory,utilization.gpu,"
+            "temperature.gpu,power.draw,power.limit,persistence_mode",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=5,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {"error": (proc.stderr or "nvidia-smi failed").strip()}
+
+    parts = [part.strip() for part in proc.stdout.strip().splitlines()[0].split(",")]
+    if len(parts) < 9:
+        return {"raw": proc.stdout.strip()}
+
+    def number(value: str) -> int | None:
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+
+    return {
+        "name": parts[0],
+        "graphics_current": number(parts[1]),
+        "memory_current": number(parts[2]),
+        "graphics_max": number(parts[3]),
+        "memory_max": number(parts[4]),
+        "utilization": number(parts[5]),
+        "temperature": number(parts[6]),
+        "power_draw": number(parts[7]),
+        "power_limit": number(parts[8]),
+        "persistence": parts[9].strip(),
+    }
+
+
+def query_cpu() -> dict:
+    policies = sorted(Path("/sys/devices/system/cpu/cpufreq").glob("policy*"))
+    if not policies:
+        return {}
+
+    def frequency_khz(path: Path) -> int:
+        try:
+            return int((path).read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0
+
+    min_khz = min(
+        (frequency_khz(policy / "scaling_min_freq") for policy in policies), default=0
+    )
+    max_khz = max(
+        (frequency_khz(policy / "scaling_max_freq") for policy in policies), default=0
+    )
+    current_khz = max(
+        (frequency_khz(policy / "scaling_cur_freq") for policy in policies), default=0
+    )
+
+    temperature = None
+    for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
+        if read_text(str(hwmon / "name")) not in ("k10temp", "zenpower", "coretemp"):
+            continue
+        try:
+            temperature = round(int(read_text(str(hwmon / "temp1_input"))) / 1000)
+        except ValueError:
+            temperature = None
+        break
+
+    return {
+        "governor": read_text(str(policies[0] / "scaling_governor")),
+        "epp": read_text(str(policies[0] / "energy_performance_preference")),
+        "min_mhz": min_khz // 1000,
+        "max_mhz": max_khz // 1000,
+        "current_mhz": current_khz // 1000,
+        "temperature": temperature,
+        "platform_profile": read_text("/sys/firmware/acpi/platform_profile"),
+    }
+
+
+def query_amd() -> dict:
+    base = Path("/sys/class/drm/card1/device")
+    temperature = None
+    for hwmon in (base / "hwmon").glob("hwmon*"):
+        value = read_text(str(hwmon / "temp1_input"))
+        try:
+            temperature = round(int(value) / 1000)
+        except ValueError:
+            pass
+        break
+
+    def integer(path: Path) -> int | None:
+        try:
+            return int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+
+    return {
+        "busy": integer(base / "gpu_busy_percent"),
+        "dpm_level": read_text(str(base / "power_dpm_force_performance_level")),
+        "temperature": temperature,
+    }
+
+
+def get_status() -> dict:
+    game_active = is_active(GAME_SERVICE)
+    perf_active = is_active(PERF_SERVICE)
+    displayed_vt = active_vt()
+
+    if displayed_vt is not None:
+        game_foreground = game_active and displayed_vt == GAME_VT
+    else:
+        game_foreground = game_active and perf_active
+
+    if game_foreground:
+        hdr_state = "active"
+    elif game_active:
+        hdr_state = "paused"
+    else:
+        hdr_state = "ready"
+
+    return {
+        "session_mode": "gamemode" if GAME_MODE_FLAG.exists() else "normal",
+        "game_active": game_active,
+        "game_foreground": game_foreground,
+        "game_paused": game_active and not game_foreground,
+        "perf_active": perf_active,
+        "active_vt": displayed_vt,
+        "niri_vt": niri_vt(),
+        "game_vt": GAME_VT,
+        "nvidia_reserved": game_active,
+        "power_profile": read_power_profile(),
+        "power_profiles": {key: POWER_LABELS[key] for key in POWER_PROFILES},
+        "hdr": {
+            "supported": True,
+            "state": hdr_state,
+        },
+        "brightness": brightness_state(),
+        "nvidia": query_nvidia(),
+        "cpu": query_cpu(),
+        "amd": query_amd(),
+        "discord": process_running("discord"),
+        "easyeffects": process_running("easyeffects"),
+        "steam_desktop": steam_running(),
+    }
+
+
+def hdr_section(modetest_output: str) -> tuple[str, str]:
+    lines = modetest_output.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if re.match(r"^\d+\s+\d+\s+(connected|disconnected)\s+eDP-1\b", line.strip()):
+            start = index
+            break
+    if start is None:
+        return "", ""
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.match(
+            r"^\d+\s+\d+\s+(connected|disconnected)\s+\S+", lines[index].strip()
+        ):
+            end = index
+            break
+
+    section = "\n".join(lines[start:end])
+    match = re.search(
+        r"(?ms)^\s*\d+\s+HDR_OUTPUT_METADATA:\s*$.*?(?=^\s*\d+\s+\S.*:$|\Z)",
+        section,
+    )
+    return section, (match.group(0) if match else "")
+
+
+def hdr_metadata_active(hdr_text: str) -> bool:
+    if not hdr_text:
+        return False
+    after_value = hdr_text.split("value:", 1)[-1]
+    if re.search(r"[0-9a-fA-F]{8,}", after_value):
+        return True
+    after_blobs = hdr_text.split("blobs:", 1)[-1]
+    return bool(re.search(r"(?m)^\s+\d+\s+\S+", after_blobs))
+
+
+def verify_hdr() -> str:
+    lines: list[str] = []
+    lines.append("HDR / GAME MODE DIAGNOSTICS")
+    lines.append("=" * 34)
+    lines.append(f"Game service:       {'active' if is_active(GAME_SERVICE) else 'inactive'}")
+    lines.append(f"Power service:      {'active' if is_active(PERF_SERVICE) else 'inactive'}")
+    lines.append(f"Power profile:      {POWER_LABELS[read_power_profile()]}")
+    lines.append(f"Active VT:          {active_vt()}")
+    lines.append(f"Niri VT:            {niri_vt()}")
+    lines.append(f"Game VT:            {GAME_VT}")
+    lines.append("")
+
+    probe = run(["modetest", "-M", "amdgpu", "-c"], timeout=8)
+    if probe.returncode != 0:
+        lines.append(f"modetest failed: {probe.stderr.strip() or probe.stdout.strip()}")
+    else:
+        section, hdr_text = hdr_section(probe.stdout)
+        if not section:
+            lines.append("eDP-1 connector was not found in modetest output.")
+        else:
+            lines.append("eDP-1 CONNECTOR")
+            lines.append("-" * 34)
+            for line in section.splitlines():
+                if re.search(
+                    r"(max bpc|Colorspace|HDR_OUTPUT_METADATA|panel_type|value:)",
+                    line,
+                ):
+                    lines.append(line.rstrip())
+            lines.append("")
+            lines.append(
+                f"HDR metadata active: {'yes' if hdr_metadata_active(hdr_text) else 'no'}"
+            )
+            lines.append("HDR metadata property:")
+            lines.append(hdr_text.rstrip() or "  <empty>")
+
+    lines.append("")
+    lines.append("NVIDIA")
+    lines.append("-" * 34)
+    nvidia = query_nvidia()
+    if nvidia:
+        for key, value in nvidia.items():
+            lines.append(f"{key}: {value}")
+    else:
+        lines.append("nvidia-smi unavailable")
+
+    lines.append("")
+    lines.append("RECENT GAMESCOPE LOG")
+    lines.append("-" * 34)
+    journal = run(
+        ["journalctl", "-u", GAME_SERVICE, "-n", "60", "--no-pager", "-o", "cat"],
+        timeout=8,
+    )
+    lines.append(journal.stdout.rstrip() or journal.stderr.strip() or "<no log>")
+
+    return "\n".join(lines)
+
+
+def print_human_status(status: dict) -> None:
+    mode = "Game Mode" if status["session_mode"] == "gamemode" else "Normal"
+    game = "running" if status["game_active"] else "stopped"
+    if status["game_paused"]:
+        game = "paused"
+    print(f"Session:        {mode}")
+    print(f"Game session:   {game}")
+    print(f"Active VT:      {status['active_vt']}")
+    print(f"HDR:            {status['hdr']['state']}")
+    print(f"Power profile:  {POWER_LABELS.get(status['power_profile'], status['power_profile'])}")
+    brightness = status.get("brightness") or {}
+    print(f"Brightness:     {brightness.get('percent', '?')}%")
+    print(f"Niri VT:        {status['niri_vt']}")
+    print(f"Game VT:        {status['game_vt']}")
+    print(f"NVIDIA reserved:{' yes' if status['nvidia_reserved'] else ' no'}")
+    print(f"Discord:        {'running' if status['discord'] else 'not running'}")
+    print(f"EasyEffects:    {'running' if status['easyeffects'] else 'not running'}")
+    cpu = status.get("cpu") or {}
+    if cpu:
+        print(
+            "CPU:            "
+            f"{cpu.get('current_mhz')} MHz "
+            f"({cpu.get('min_mhz')}-{cpu.get('max_mhz')}) "
+            f"{cpu.get('governor')}/{cpu.get('epp')} "
+            f"{cpu.get('temperature')}°C"
+        )
+    nvidia = status.get("nvidia") or {}
+    if nvidia:
+        print(
+            "NVIDIA clocks:  "
+            f"{nvidia.get('graphics_current')} / {nvidia.get('memory_current')} MHz "
+            f"(max {nvidia.get('graphics_max')} / {nvidia.get('memory_max')}) "
+            f"{nvidia.get('temperature')}°C {nvidia.get('power_draw')} W"
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="game-mode",
+        description="Switch between niri and the tty2 Steam Big Picture HDR session.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    status_parser = subparsers.add_parser("status", help="Show current mode and status")
+    status_parser.add_argument("--json", action="store_true", help="Emit JSON")
+
+    subparsers.add_parser("game", help="Start or focus the tty2 game session")
+    subparsers.add_parser("desktop", help="Return to niri, keeping the game paused")
+    subparsers.add_parser("pause", help="Alias for desktop")
+    subparsers.add_parser("return", help="Alias for desktop")
+    subparsers.add_parser("quit", help="Stop the game session and release NVIDIA")
+    subparsers.add_parser("stop", help="Alias for quit")
+    subparsers.add_parser("toggle", help="Toggle between game and desktop")
+    subparsers.add_parser("autostart", help="Start game mode for the GDM game session")
+    subparsers.add_parser("verify-hdr", help="Print HDR diagnostics")
+
+    power_parser = subparsers.add_parser(
+        "power", help="Select the game-only NVIDIA power profile"
+    )
+    power_parser.add_argument(
+        "profile", nargs="?", default="status", choices=(*POWER_PROFILES, "status")
+    )
+
+    brightness_parser = subparsers.add_parser(
+        "brightness", help="Read or step the panel backlight"
+    )
+    brightness_parser.add_argument(
+        "action", nargs="?", default="status", choices=("status", "up", "down")
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "status":
+        remember_niri_vt()
+        status = get_status()
+        if args.json:
+            print(json.dumps(status, indent=2))
+        else:
+            print_human_status(status)
+        return 0
+
+    if args.command == "verify-hdr":
+        print(verify_hdr())
+        return 0
+
+    if args.command == "game":
+        return start_game()
+
+    if args.command in {"desktop", "pause", "return"}:
+        return pause_desktop()
+
+    if args.command in {"quit", "stop"}:
+        return quit_game()
+
+    if args.command == "power":
+        if args.profile == "status":
+            print(read_power_profile())
+            return 0
+        return set_power_profile(args.profile)
+
+    if args.command == "brightness":
+        if args.action == "status":
+            state = brightness_state()
+            if not state.get("available"):
+                print("unavailable")
+                return 1
+            print(f"{state['percent']}%")
+            return 0
+        return adjust_brightness(1 if args.action == "up" else -1)
+
+    if args.command == "toggle":
+        status = get_status()
+        if status["game_active"] and status["game_foreground"]:
+            return pause_desktop()
+        return start_game()
+
+    if args.command == "autostart":
+        return start_game(autostart=True)
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
