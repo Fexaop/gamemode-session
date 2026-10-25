@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""GTK4/libadwaita front end for the Game Mode backend."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+from collections.abc import Callable
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.gunit.GameMode"
+BACKEND = str(Path.home() / ".local" / "bin" / "game-mode")
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "game-mode"
+GUI_CONFIG = CONFIG_DIR / "gui.json"
+
+
+class GameModeWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application):
+        super().__init__(application=app, title="Game Mode")
+        self.set_default_size(520, 780)
+        self.set_size_request(460, 620)
+
+        self._busy = False
+        self._refreshing = False
+        self._status: dict = {}
+        self._keep_running = self._load_keep_running()
+        self._rows: dict[str, Gtk.Label] = {}
+        self._power_buttons: dict[str, Gtk.Button] = {}
+        self._brightness_buttons: list[Gtk.Button] = []
+        self._refresh_source = 0
+
+        self._build_ui()
+        self._apply_css()
+        self._refresh()
+        self.connect("notify::visible", self._on_visibility_changed)
+        self.connect("notify::mapped", self._on_visibility_changed)
+        self._update_refresh_timer()
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self) -> None:
+        toolbar = Adw.ToolbarView()
+
+        header = Adw.HeaderBar()
+        self._title = Adw.WindowTitle(title="Game Mode", subtitle="Checking status…")
+        header.set_title_widget(self._title)
+
+        self._spinner = Gtk.Spinner()
+        self._spinner.set_visible(False)
+        header.pack_start(self._spinner)
+
+        refresh_button = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_button.set_tooltip_text("Refresh status")
+        refresh_button.connect("clicked", lambda *_: self._refresh())
+        header.pack_end(refresh_button)
+
+        toolbar.add_top_bar(header)
+
+        self._toasts = Adw.ToastOverlay()
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        scrolled.set_child(self._toasts)
+        toolbar.set_content(scrolled)
+        self.set_content(toolbar)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        content.set_margin_top(20)
+        content.set_margin_bottom(22)
+        content.set_margin_start(20)
+        content.set_margin_end(20)
+        self._toasts.set_child(content)
+
+        # Mode cards
+        cards = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        cards.set_homogeneous(True)
+
+        self._desktop_card, self._desktop_state = self._make_card(
+            "computer-symbolic",
+            "Desktop",
+            "Niri · Discord · EasyEffects",
+        )
+        self._desktop_card.connect("clicked", self._on_desktop_clicked)
+        cards.append(self._desktop_card)
+
+        self._game_card, self._game_state = self._make_card(
+            "applications-games-symbolic",
+            "Steam HDR",
+            "tty2 · Big Picture · NVIDIA",
+        )
+        self._game_card.connect("clicked", self._on_game_clicked)
+        cards.append(self._game_card)
+
+        content.append(cards)
+
+        # Keep-running switch
+        switch_group = Adw.PreferencesGroup()
+        self._keep_row = Adw.SwitchRow(
+            title="Keep game running",
+            subtitle="Pause the game instead of closing it when you return to Desktop",
+        )
+        self._keep_row.set_active(self._keep_running)
+        self._keep_row.connect("notify::active", self._on_keep_running_changed)
+        switch_group.add(self._keep_row)
+        content.append(switch_group)
+
+        # Power profiles (one-shot systemd actions; no daemon)
+        power_group = Adw.PreferencesGroup(
+            title="NVIDIA power profile",
+            description="NVIDIA only. CPU, ASUS, platform, and AMD settings are never changed.",
+        )
+        power_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        power_box.set_homogeneous(True)
+        for key, label, tooltip in (
+            (
+                "balanced",
+                "Balanced",
+                "Reset NVIDIA clocks and the power limit to automatic/default",
+            ),
+            (
+                "boost",
+                "Boost",
+                "Lock NVIDIA graphics and memory to their maximum clocks at the default power limit",
+            ),
+            (
+                "burn",
+                "Burn PC",
+                "Absolute NVIDIA max: max graphics and memory clocks, persistence enabled",
+            ),
+        ):
+            button = Gtk.Button(label=label)
+            button.set_tooltip_text(tooltip)
+            button.add_css_class("pill")
+            button.add_css_class("power-button")
+            if key == "burn":
+                button.add_css_class("burn-button")
+            button.connect("clicked", self._on_power_clicked, key)
+            power_box.append(button)
+            self._power_buttons[key] = button
+        power_group.add(power_box)
+        content.append(power_group)
+
+        # Brightness: buttons only, no slider.  A slider would compete with
+        # niri, Steam, and the kernel backlight control.
+        brightness_group = Adw.PreferencesGroup(
+            title="HDR brightness",
+            description="5% steps. This writes the amdgpu_bl1 backlight directly.",
+        )
+        brightness_row = Adw.ActionRow(title="Panel backlight")
+        brightness_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8
+        )
+        brightness_box.set_valign(Gtk.Align.CENTER)
+        down = Gtk.Button(label="−")
+        down.set_tooltip_text("Dim by 5%")
+        down.add_css_class("circular")
+        down.add_css_class("brightness-button")
+        down.connect("clicked", self._on_brightness_clicked, "down")
+        brightness_box.append(down)
+
+        self._brightness_label = Gtk.Label(label="—")
+        self._brightness_label.set_width_chars(5)
+        self._brightness_label.set_xalign(0.5)
+        self._brightness_label.add_css_class("title-4")
+        brightness_box.append(self._brightness_label)
+
+        up = Gtk.Button(label="+")
+        up.set_tooltip_text("Brighten by 5%")
+        up.add_css_class("circular")
+        up.add_css_class("brightness-button")
+        up.connect("clicked", self._on_brightness_clicked, "up")
+        brightness_box.append(up)
+
+        brightness_row.add_suffix(brightness_box)
+        brightness_group.add(brightness_row)
+        content.append(brightness_group)
+        self._brightness_buttons.extend((down, up))
+
+        # Status
+        status_group = Adw.PreferencesGroup(title="Status")
+        for key, label in (
+            ("game", "Game session"),
+            ("hdr", "HDR"),
+            ("power", "NVIDIA profile"),
+            ("cpu", "CPU (read-only)"),
+            ("nvidia", "NVIDIA"),
+            ("discord", "Discord"),
+            ("easyeffects", "EasyEffects"),
+        ):
+            row = Adw.ActionRow(title=label)
+            value = Gtk.Label(label="—")
+            value.set_xalign(1.0)
+            value.set_halign(Gtk.Align.END)
+            value.add_css_class("dim-label")
+            row.add_suffix(value)
+            status_group.add(row)
+            self._rows[key] = value
+        content.append(status_group)
+
+        # Actions
+        action_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        primary_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        primary_row.set_homogeneous(True)
+
+        self._pause_button = Gtk.Button(label="Pause & Return")
+        self._pause_button.add_css_class("pill")
+        self._pause_button.connect("clicked", self._on_pause_clicked)
+        primary_row.append(self._pause_button)
+
+        self._quit_button = Gtk.Button(label="Quit Game")
+        self._quit_button.add_css_class("pill")
+        self._quit_button.add_css_class("destructive-action")
+        self._quit_button.connect("clicked", self._on_quit_clicked)
+        primary_row.append(self._quit_button)
+
+        action_box.append(primary_row)
+
+        self._verify_button = Gtk.Button(label="Verify HDR")
+        self._verify_button.add_css_class("pill")
+        self._verify_button.connect("clicked", self._on_verify_clicked)
+        action_box.append(self._verify_button)
+
+        content.append(action_box)
+
+        footer = Gtk.Label(
+            label=(
+                "Big Picture stays strict on tty2. NVIDIA profiles apply only while "
+                "gaming; returning to Desktop releases the clocks. Brightness is "
+                "only changed with the − / + buttons."
+            )
+        )
+        footer.set_wrap(True)
+        footer.set_justify(Gtk.Justification.CENTER)
+        footer.add_css_class("dim-label")
+        footer.add_css_class("caption")
+        content.append(footer)
+
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_controller)
+
+    def _make_card(
+        self, icon_name: str, title: str, subtitle: str
+    ) -> tuple[Gtk.Button, Gtk.Label]:
+        button = Gtk.Button()
+        button.set_hexpand(True)
+        button.set_valign(Gtk.Align.FILL)
+        button.add_css_class("card")
+        button.add_css_class("mode-card")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+
+        image = Gtk.Image.new_from_icon_name(icon_name)
+        image.set_pixel_size(36)
+        image.set_halign(Gtk.Align.CENTER)
+        box.append(image)
+
+        title_label = Gtk.Label(label=title)
+        title_label.add_css_class("title-3")
+        title_label.set_halign(Gtk.Align.CENTER)
+        box.append(title_label)
+
+        subtitle_label = Gtk.Label(label=subtitle)
+        subtitle_label.add_css_class("dim-label")
+        subtitle_label.add_css_class("caption")
+        subtitle_label.set_wrap(True)
+        subtitle_label.set_justify(Gtk.Justification.CENTER)
+        subtitle_label.set_halign(Gtk.Align.CENTER)
+        box.append(subtitle_label)
+
+        state_label = Gtk.Label(label="—")
+        state_label.add_css_class("caption")
+        state_label.add_css_class("dim-label")
+        state_label.set_halign(Gtk.Align.CENTER)
+        box.append(state_label)
+
+        button.set_child(box)
+        return button, state_label
+
+    def _apply_css(self) -> None:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(
+            b"""
+            .mode-card {
+                padding: 14px;
+                border-radius: 14px;
+            }
+            .mode-card.active {
+                outline: 2px solid @accent_color;
+                background: alpha(@accent_bg_color, 0.18);
+            }
+            .power-button.active {
+                background: @accent_bg_color;
+                color: @accent_fg_color;
+            }
+            .burn-button {
+                color: @error_color;
+            }
+            .brightness-button {
+                min-width: 30px;
+                min-height: 30px;
+                padding: 0;
+            }
+            """
+        )
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+    # --------------------------------------------------------------- config
+    def _load_keep_running(self) -> bool:
+        try:
+            data = json.loads(GUI_CONFIG.read_text(encoding="utf-8"))
+            return bool(data.get("keep_running", True))
+        except (OSError, ValueError):
+            return True
+
+    def _save_keep_running(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            GUI_CONFIG.write_text(
+                json.dumps({"keep_running": self._keep_running}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _on_keep_running_changed(self, row: Adw.SwitchRow, _pspec) -> None:
+        self._keep_running = row.get_active()
+        self._save_keep_running()
+
+    # ------------------------------------------------------------ power modes
+    def _on_power_clicked(self, _button: Gtk.Button, profile: str) -> None:
+        if self._busy:
+            return
+        if profile == self._status.get("power_profile"):
+            return
+        if profile == "burn":
+            dialog = Adw.AlertDialog(
+                heading="Enable Burn PC?",
+                body=(
+                    "This is NVIDIA-only: it locks the GPU to maximum graphics and "
+                    "memory clocks and enables persistence. The laptop vBIOS may "
+                    "not expose a power-limit control; if it does, the limit is "
+                    "also raised to maximum. CPU, ASUS, platform, and AMD settings "
+                    "are not touched. GPU heat and fan noise will increase."
+                ),
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("burn", "Burn PC")
+            dialog.set_response_appearance("burn", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response("cancel")
+            dialog.set_close_response("cancel")
+
+            def on_response(dialog: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
+                try:
+                    response = dialog.choose_finish(result)
+                except GLib.Error:
+                    return
+                if response == "burn":
+                    self._apply_power("burn")
+
+            dialog.choose(self, None, on_response)
+            return
+        self._apply_power(profile)
+
+    def _apply_power(self, profile: str) -> None:
+        labels = {"balanced": "Balanced", "boost": "Boost", "burn": "Burn PC"}
+        self._run_backend(
+            ["power", profile],
+            f"NVIDIA profile: {labels.get(profile, profile)}",
+        )
+
+    def _on_brightness_clicked(self, _button: Gtk.Button, action: str) -> None:
+        if self._busy:
+            return
+        self._run_backend(["brightness", action])
+
+    # --------------------------------------------------------------- actions
+    def _set_busy(self, busy: bool, message: str | None = None) -> None:
+        self._busy = busy
+        self._spinner.set_visible(busy)
+        if busy:
+            self._spinner.start()
+            self._title.set_subtitle(message or "Working…")
+        else:
+            self._spinner.stop()
+        for widget in (
+            self._desktop_card,
+            self._game_card,
+            self._pause_button,
+            self._quit_button,
+            self._verify_button,
+            self._keep_row,
+            *self._power_buttons.values(),
+            *self._brightness_buttons,
+        ):
+            widget.set_sensitive(not busy)
+
+    def _run_backend(
+        self,
+        args: list[str],
+        success: str | None = None,
+        on_output: Callable[[str], None] | None = None,
+    ) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+
+        def worker() -> None:
+            try:
+                proc = subprocess.run(
+                    [BACKEND, *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                GLib.idle_add(
+                    self._backend_done,
+                    proc.returncode,
+                    proc.stdout,
+                    proc.stderr,
+                    success,
+                    on_output,
+                )
+            except Exception as exc:  # noqa: BLE001
+                GLib.idle_add(
+                    self._backend_done,
+                    1,
+                    "",
+                    str(exc),
+                    success,
+                    on_output,
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _backend_done(
+        self,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        success: str | None,
+        on_output: Callable[[str], None] | None,
+    ) -> bool:
+        self._set_busy(False)
+        if returncode != 0:
+            detail = (stderr or stdout or "Command failed").strip()
+            self._toast(detail[-500:])
+        else:
+            if on_output is not None:
+                on_output(stdout)
+            elif success:
+                self._toast(success)
+        self._refresh()
+        return False
+
+    def _toast(self, message: str) -> None:
+        if message:
+            self._toasts.add_toast(Adw.Toast.new(message))
+
+    def _on_desktop_clicked(self, *_args) -> None:
+        if not self._status.get("game_active"):
+            self._toast("Game session is not running")
+            return
+        if self._keep_running:
+            self._run_backend(["desktop"], "Game paused; back on Desktop")
+        else:
+            self._confirm_quit(
+                "Return to Desktop?",
+                "The game session will close and NVIDIA will be released.",
+                "desktop",
+            )
+
+    def _on_game_clicked(self, *_args) -> None:
+        label = "Resuming Steam Big Picture" if self._status.get("game_active") else "Starting Steam Big Picture"
+        self._run_backend(["game"], label)
+
+    def _on_pause_clicked(self, *_args) -> None:
+        self._run_backend(["desktop"], "Game paused; back on Desktop")
+
+    def _on_quit_clicked(self, *_args) -> None:
+        self._confirm_quit(
+            "Quit game session?",
+            "Steam Big Picture will close, clocks will be restored, and NVIDIA will be released to the desktop.",
+            "quit",
+        )
+
+    def _confirm_quit(self, heading: str, body: str, action: str) -> None:
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response(action, "Quit Game" if action == "quit" else "Return")
+        dialog.set_response_appearance(action, Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(dialog: Adw.AlertDialog, result: Gio.AsyncResult) -> None:
+            try:
+                response = dialog.choose_finish(result)
+            except GLib.Error:
+                return
+            if response == action:
+                if action == "quit":
+                    self._run_backend(["quit"], "Game session closed; NVIDIA released")
+                else:
+                    self._run_backend(["quit"], "Back on Desktop; NVIDIA released")
+
+        dialog.choose(self, None, on_response)
+
+    def _on_verify_clicked(self, *_args) -> None:
+        self._run_backend(["verify-hdr"], on_output=self._show_diagnostics)
+
+    def _show_diagnostics(self, text: str) -> None:
+        dialog = Adw.AlertDialog(
+            heading="HDR diagnostics",
+            body="Connector metadata and recent gamescope output",
+        )
+        dialog.add_response("close", "Close")
+        dialog.set_default_response("close")
+        dialog.set_close_response("close")
+
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_monospace(True)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.get_buffer().set_text(text)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_width(620)
+        scrolled.set_min_content_height(420)
+        scrolled.set_child(view)
+        dialog.set_extra_child(scrolled)
+        dialog.choose(self, None, lambda *_: None)
+
+    # ---------------------------------------------------------------- status
+    def _on_visibility_changed(self, *_args) -> None:
+        self._update_refresh_timer()
+
+    def _desktop_is_front(self) -> bool:
+        """Skip backend polling while niri is hidden behind tty2."""
+        own_vt = os.environ.get("XDG_VTNR", "")
+        if not own_vt.isdigit():
+            return True
+        try:
+            active = Path("/sys/class/tty/tty0/active").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            return True
+        return active == f"tty{own_vt}"
+
+    def _update_refresh_timer(self) -> None:
+        should_run = bool(self.get_visible() and self.get_mapped())
+        if should_run and self._refresh_source == 0:
+            self._refresh_source = GLib.timeout_add_seconds(5, self._refresh_tick)
+        elif not should_run and self._refresh_source:
+            GLib.source_remove(self._refresh_source)
+            self._refresh_source = 0
+
+    def _refresh_tick(self) -> bool:
+        if not self.get_visible() or not self.get_mapped():
+            self._refresh_source = 0
+            return False
+        if self._desktop_is_front():
+            self._refresh()
+        return True
+
+    def _refresh(self) -> bool:
+        if self._busy or self._refreshing:
+            return True
+        self._refreshing = True
+
+        def worker() -> None:
+            try:
+                proc = subprocess.run(
+                    [BACKEND, "status", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                )
+                data = json.loads(proc.stdout) if proc.returncode == 0 else None
+                error = None if data is not None else (proc.stderr or proc.stdout or "status failed")
+                GLib.idle_add(self._apply_status, data, error)
+            except Exception as exc:  # noqa: BLE001
+                GLib.idle_add(self._apply_status, None, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _apply_status(self, data: dict | None, error: str | None) -> bool:
+        self._refreshing = False
+        if data is None:
+            self._title.set_subtitle("Backend unavailable")
+            self._toast((error or "Could not read game-mode status")[-500:])
+            return False
+
+        self._status = data
+        brightness = data.get("brightness") or {}
+        if brightness.get("available"):
+            self._brightness_label.set_text(f"{brightness.get('percent', '?')}%")
+        else:
+            self._brightness_label.set_text("—")
+
+        game_active = bool(data.get("game_active"))
+        game_foreground = bool(data.get("game_foreground"))
+        paused = bool(data.get("game_paused"))
+        hdr_state = data.get("hdr", {}).get("state", "ready")
+        profile = data.get("power_profile", "boost")
+        profile_labels = data.get("power_profiles") or {}
+
+        if game_active and paused:
+            self._title.set_subtitle("Game paused on tty2")
+        elif game_foreground:
+            self._title.set_subtitle("Steam Big Picture active on tty2")
+        else:
+            self._title.set_subtitle("Desktop — game session stopped")
+
+        self._desktop_card.remove_css_class("active")
+        self._game_card.remove_css_class("active")
+        if game_foreground:
+            self._game_card.add_css_class("active")
+            self._game_state.set_text("Running")
+            self._desktop_state.set_text("Available")
+        else:
+            self._desktop_card.add_css_class("active")
+            self._game_state.set_text("Paused" if game_active else "Start Big Picture")
+            self._desktop_state.set_text("Active")
+
+        self._set_value(
+            "game",
+            "Paused" if paused else ("Running" if game_active else "Stopped"),
+        )
+        self._set_value(
+            "hdr",
+            {"active": "Active", "paused": "Paused", "ready": "Ready on tty2"}.get(
+                hdr_state, hdr_state.title()
+            ),
+            "success" if hdr_state == "active" else ("warning" if hdr_state == "paused" else None),
+        )
+        self._set_value(
+            "power",
+            profile_labels.get(profile, profile.title()),
+            "success" if game_active else None,
+        )
+
+        for key, button in self._power_buttons.items():
+            if key == profile:
+                button.add_css_class("active")
+            else:
+                button.remove_css_class("active")
+
+        cpu = data.get("cpu") or {}
+        if cpu:
+            cpu_parts = [f"{cpu.get('current_mhz', '?')} MHz"]
+            if cpu.get("governor"):
+                cpu_parts.append(str(cpu["governor"]))
+            if cpu.get("temperature") is not None:
+                cpu_parts.append(f"{cpu['temperature']}°C")
+            self._set_value("cpu", " · ".join(cpu_parts))
+        else:
+            self._set_value("cpu", "—")
+
+        nvidia = data.get("nvidia") or {}
+        if nvidia.get("graphics_current") is not None:
+            locked = profile == "burn"
+            details = f"{nvidia.get('graphics_current')} / {nvidia.get('memory_current')} MHz"
+            if nvidia.get("temperature") is not None:
+                details += f" · {nvidia['temperature']}°C"
+            if nvidia.get("power_draw") is not None:
+                details += f" · {nvidia['power_draw']} W"
+            details += " · locked" if locked else " · auto"
+            self._set_value(
+                "nvidia",
+                details,
+                "success" if locked else None,
+            )
+        elif nvidia.get("error"):
+            self._set_value("nvidia", "Unavailable", "error")
+        else:
+            self._set_value("nvidia", "—")
+
+        self._set_value(
+            "discord",
+            "Running" if data.get("discord") else "Not running",
+            "success" if data.get("discord") else None,
+        )
+        self._set_value(
+            "easyeffects",
+            "Running" if data.get("easyeffects") else "Not running",
+            "success" if data.get("easyeffects") else None,
+        )
+
+        self._pause_button.set_sensitive(game_active and not paused)
+        self._quit_button.set_sensitive(game_active)
+        self._desktop_card.set_sensitive(True)
+        self._game_card.set_sensitive(True)
+        return False
+
+    def _set_value(self, key: str, text: str, css_class: str | None = None) -> None:
+        label = self._rows[key]
+        label.set_text(text)
+        for name in ("success", "warning", "error", "dim-label"):
+            label.remove_css_class(name)
+        if css_class:
+            label.add_css_class(css_class)
+        else:
+            label.add_css_class("dim-label")
+
+    # --------------------------------------------------------------- keyboard
+    def _on_key_pressed(self, _controller, keyval, _keycode, _state) -> bool:
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        if self._busy:
+            return False
+        if keyval == Gdk.KEY_d:
+            self._on_desktop_clicked()
+            return True
+        if keyval == Gdk.KEY_g:
+            self._on_game_clicked()
+            return True
+        if keyval == Gdk.KEY_q:
+            self._on_quit_clicked()
+            return True
+        if keyval == Gdk.KEY_v:
+            self._on_verify_clicked()
+            return True
+        return False
+
+
+class GameModeApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self._window: GameModeWindow | None = None
+
+    def do_activate(self) -> None:
+        if self._window is None:
+            self._window = GameModeWindow(self)
+        self._window.present()
+
+
+def main() -> int:
+    app = GameModeApp()
+    return app.run([])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
