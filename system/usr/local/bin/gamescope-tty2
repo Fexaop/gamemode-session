@@ -1,0 +1,54 @@
+#!/bin/bash
+# Strict Steam Big Picture on tty2.
+# AMD scans out the panel; Steam and games are forced onto the NVIDIA GPU.
+set -euo pipefail
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export XDG_SESSION_TYPE=x11
+export XDG_SESSION_DESKTOP=gamescope
+export XDG_CURRENT_DESKTOP=gamescope
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+
+# The panel is wired to the AMD iGPU.  Point gamescope at card1, not the
+# display-less NVIDIA card0.
+export WLR_DRM_DEVICES=/dev/dri/by-path/pci-0000:04:00.0-card
+
+# Steam/Proton HDR plumbing.
+export STEAM_GAMESCOPE_HDR_SUPPORTED=1
+export DXVK_HDR=1
+export PROTON_ENABLE_HDR=1
+export ENABLE_GAMESCOPE_WSI=1
+
+# CachyOS/SteamOS compatibility files.
+export GAMESCOPE_MODE_SAVE_FILE="${HOME}/.config/gamescope/modes.cfg"
+export GAMESCOPE_PATCHED_EDID_FILE="${HOME}/.config/gamescope/edid.bin"
+
+# Run the one-shot HDR tuning helper in this same PAM session.  A separate
+# ExecStartPost opens a second logind session on tty2 and steals the seat from
+# gamescope (VirtualTerminalAlreadyTaken), so keep it as a background child.
+/usr/local/bin/game-mode-gamescope-tune &
+
+exec gamescope \
+    --backend drm \
+    --generate-drm-mode fixed \
+    --xwayland-count 2 \
+    --expose-wayland \
+    --default-touch-mode 4 \
+    --hide-cursor-delay 3000 \
+    --fade-out-duration 200 \
+    --hdr-enabled \
+    --hdr-sdr-content-nits 400 \
+    --prefer-vk-device 1002:1638 \
+    -W 1920 -H 1080 \
+    -O eDP-1 \
+    -e \
+    -- \
+    env \
+        VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json \
+        __NV_PRIME_RENDER_OFFLOAD=1 \
+        __GLX_VENDOR_LIBRARY_NAME=nvidia \
+        DXVK_HDR=1 \
+        PROTON_ENABLE_HDR=1 \
+        ENABLE_GAMESCOPE_WSI=1 \
+        STEAM_GAMESCOPE_HDR_SUPPORTED=1 \
+        /usr/lib/steamos/steam-launcher

@@ -1,0 +1,25 @@
+[Unit]
+Description=Steam Big Picture on tty2 (HDR, NVIDIA)
+After=systemd-user-sessions.service autovt@tty2.service
+Conflicts=getty@tty2.service autovt@tty2.service
+Before=getty@tty2.service
+
+[Service]
+User=gunit
+PAMName=login
+TTYPath=/dev/tty2
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=no
+UtmpIdentifier=tty2
+UtmpMode=user
+Environment=XDG_SESSION_TYPE=x11
+Environment=XDG_SESSION_DESKTOP=gamescope
+Environment=XDG_CURRENT_DESKTOP=gamescope
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/gamescope-tty2
+ExecStopPost=-/usr/local/bin/game-mode-cleanup
+Restart=no
+TimeoutStopSec=30
+KillMode=mixed
+Slice=game.slice

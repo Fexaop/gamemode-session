@@ -1,0 +1,21 @@
+#!/bin/bash
+# One-shot post-start tuning for the tty2 gamescope session.
+#
+# Keep the panel in SDR for ordinary SDR content.  HDR is enabled only when an
+# application actually submits HDR content, which prevents Big Picture and SDR
+# games from looking dim.
+set -u
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export GAMESCOPE_WAYLAND_DISPLAY=gamescope-0
+
+for _ in $(seq 1 40); do
+    if gamescopectl hdr_content_driven 1 >/dev/null 2>&1; then
+        logger -t game-mode-gamescope -- "content-driven HDR enabled" 2>/dev/null || true
+        exit 0
+    fi
+    sleep 0.25
+done
+
+logger -t game-mode-gamescope -- "could not set content-driven HDR" 2>/dev/null || true
+exit 0
