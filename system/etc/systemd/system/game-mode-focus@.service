@@ -1,0 +1,6 @@
+[Unit]
+Description=Switch to VT %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/chvt %i

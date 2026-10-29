@@ -1,0 +1,4 @@
+#!/bin/bash
+# ExecStopPost cleanup for gamescope-tty2.service.
+set -u
+exec /usr/local/bin/game-mode-return

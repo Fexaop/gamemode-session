@@ -1,0 +1,13 @@
+#!/bin/bash
+# Return to the niri VT and release clock locks, without stopping gamescope.
+set -u
+
+uid="$(id -u gunit 2>/dev/null || echo 1000)"
+vt="$(cat "/run/user/${uid}/game-mode.niri-vt" 2>/dev/null || echo 4)"
+case "$vt" in
+    ''|*[!0-9]*) vt=4 ;;
+esac
+
+systemctl stop game-mode-perf.service >/dev/null 2>&1 || true
+chvt "$vt" >/dev/null 2>&1 || true
+logger -t game-mode-return -- "returned to VT ${vt}" 2>/dev/null || true

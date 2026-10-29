@@ -1,0 +1,6 @@
+[Unit]
+Description=Return to niri and release game-mode clock locks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/game-mode-return

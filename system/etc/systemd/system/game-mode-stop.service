@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop the tty2 game session and release NVIDIA
+PartOf=gamescope-tty2.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/game-mode-stop
+TimeoutStartSec=60

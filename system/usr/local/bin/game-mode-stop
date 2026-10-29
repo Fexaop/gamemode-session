@@ -1,0 +1,15 @@
+#!/bin/bash
+# Stop the tty2 game session completely, release NVIDIA, return to niri.
+set -u
+
+systemctl stop gamescope-tty2.service >/dev/null 2>&1 || true
+systemctl stop game-mode-perf.service >/dev/null 2>&1 || true
+
+uid="$(id -u gunit 2>/dev/null || echo 1000)"
+vt="$(cat "/run/user/${uid}/game-mode.niri-vt" 2>/dev/null || echo 4)"
+case "$vt" in
+    ''|*[!0-9]*) vt=4 ;;
+esac
+
+chvt "$vt" >/dev/null 2>&1 || true
+logger -t game-mode-stop -- "game session stopped, returned to VT ${vt}" 2>/dev/null || true
