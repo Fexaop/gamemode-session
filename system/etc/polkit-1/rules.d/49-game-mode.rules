@@ -1,0 +1,23 @@
+// Allow the local desktop user to manage only the game-mode units without a
+// password prompt.  Everything else still goes through normal polkit rules.
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return;
+    }
+    if (!subject.local || subject.user !== "gunit") {
+        return;
+    }
+
+    var unit = action.lookup("unit");
+    if (!unit) {
+        return;
+    }
+
+    if (unit === "gamescope-tty2.service" ||
+        unit === "game-mode-perf.service" ||
+        unit === "game-mode-return.service" ||
+        unit === "game-mode-stop.service" ||
+        unit.indexOf("game-mode-focus@") === 0) {
+        return polkit.Result.YES;
+    }
+});
