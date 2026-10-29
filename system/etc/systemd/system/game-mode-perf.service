@@ -1,0 +1,11 @@
+[Unit]
+Description=Game mode NVIDIA power profile
+PartOf=gamescope-tty2.service
+After=gamescope-tty2.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=GAME_MODE_HOME=/home/gunit
+ExecStart=/usr/local/bin/game-mode-perf apply
+ExecStop=/usr/local/bin/game-mode-perf off
