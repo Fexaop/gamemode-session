@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Niri + Steam Big Picture (HDR)
+Comment=Niri desktop with Discord/EasyEffects, plus tty2 Steam Big Picture using NVIDIA and HDR
+Exec=/usr/local/bin/niri-gamemode-session
+Icon=applications-games
+Type=Application
+DesktopNames=niri

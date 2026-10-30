@@ -1,0 +1,10 @@
+#!/bin/sh
+# GDM session wrapper: starts niri normally, but marks this login as the
+# "Game Mode" session so the user autostart unit starts tty2 Big Picture.
+set -eu
+
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+: > "$runtime/niri-game-mode"
+export NIRI_GAME_MODE=1
+
+exec /usr/bin/niri-session
