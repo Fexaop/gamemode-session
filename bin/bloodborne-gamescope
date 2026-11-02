@@ -1,0 +1,42 @@
+#!/bin/bash
+# Launch Bloodborne inside the tty2 gamescope session.
+#
+# With no arguments this opens the bbport launcher so its Play button can be
+# used.  Pass --play to skip the launcher and use the saved settings directly.
+set -euo pipefail
+
+package="${BLOODBORNE_DIR:-$HOME/Downloads/Bloodborne-bbport-0.7-linux-x86_64}"
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+wayland_display="${BLOODBORNE_WAYLAND_DISPLAY:-gamescope-0}"
+
+if [ ! -x "$package/Bloodborne.sh" ]; then
+    echo "Bloodborne package not found: $package" >&2
+    exit 1
+fi
+
+if [ ! -S "$runtime/$wayland_display" ]; then
+    echo "gamescope Wayland socket not found: $runtime/$wayland_display" >&2
+    echo "Start the tty2 game session first (Game Mode -> Steam HDR)." >&2
+    exit 1
+fi
+
+export XDG_RUNTIME_DIR="$runtime"
+export WAYLAND_DISPLAY="$wayland_display"
+export SDL_VIDEODRIVER=wayland
+
+# The port runs natively through Vulkan, not Proton.  Force the NVIDIA ICD so
+# it renders on the RTX 3050 while gamescope composites on the AMD iGPU.
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+# Requested by the port's known-good tty2 configuration.
+export BB_DLSS=0
+export ENABLE_GAMESCOPE_WSI=1
+export DXVK_HDR=1
+export PROTON_ENABLE_HDR=1
+export STEAM_GAMESCOPE_HDR_SUPPORTED=1
+
+cd "$package"
+exec "$package/Bloodborne.sh" "$@"
