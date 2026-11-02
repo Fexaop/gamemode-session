@@ -1,0 +1,6 @@
+// Game Mode GUI: NVIDIA profiles, brightness controls, start/return/quit.
+// Paste this inside the binds { ... } block of ~/.config/niri/config.kdl.
+//
+// The installer also writes a rendered copy to
+// ~/.config/niri/game-mode-keybind.kdl using your real home directory.
+Mod+Shift+G { spawn "sh" "-c" "exec \"$HOME/.local/bin/game-mode-gui\""; }
