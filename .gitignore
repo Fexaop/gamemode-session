@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Editor and OS noise
+.DS_Store
+*~
+
+# Local backups and scratch files
+*.bak
+*.bak.*
+*.bak-*
+*.tmp
+*.orig
+*.rej
+
+# Personal bbport settings (the repo ships an example)
+config/bbport/settings.json
