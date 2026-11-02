@@ -1,0 +1,95 @@
+#!/bin/bash
+# Run any command inside the running tty2 gamescope session.
+#
+# Examples (run from a niri terminal, no VT switch needed):
+#   game-exec foot
+#   game-exec bloodborne-gamescope --play
+#   game-exec steam -gamepadui
+#
+# The command inherits the tty2 Wayland socket, gamescope's Xwayland DISPLAY,
+# the NVIDIA Vulkan ICD, and the HDR environment.
+set -u
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: game-exec <command> [args...]" >&2
+    exit 2
+fi
+
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+display="${GAME_TERMINAL_DISPLAY:-gamescope-0}"
+socket="$runtime/$display"
+original_wayland="${WAYLAND_DISPLAY:-}"
+
+if [ ! -S "$socket" ]; then
+    message="tty2 gamescope is not running (no $socket). Start Game Mode first."
+    printf '%s\n' "$message" >&2
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a "Game Mode" "Cannot launch in tty2" "$message" || true
+    fi
+    exit 1
+fi
+
+export XDG_RUNTIME_DIR="$runtime"
+export WAYLAND_DISPLAY="$display"
+export XDG_CURRENT_DESKTOP=gamescope
+
+# Read DISPLAY from a process that belongs to the gamescope session.  Exact
+# process names are used so this script's own command line cannot match.
+steam_display() {
+    local pid value wd
+    local -a candidates=()
+
+    for pid in $(pgrep -u "$(id -u)" -x steamwebhelper 2>/dev/null) \
+               $(pgrep -u "$(id -u)" -x steam 2>/dev/null) \
+               $(pgrep -u "$(id -u)" -x steam-launcher 2>/dev/null); do
+        [ -r "/proc/$pid/environ" ] || continue
+        candidates+=("$pid")
+    done
+
+    # First pass: a Steam process whose Wayland socket is this gamescope.
+    for pid in "${candidates[@]}"; do
+        wd=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' |
+            sed -n 's/^WAYLAND_DISPLAY=//p' | head -n1)
+        [ "$wd" = "$display" ] || continue
+        value=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' |
+            sed -n 's/^DISPLAY=//p' | head -n1)
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+
+    # Second pass: any Steam process (single-session laptop fallback).
+    for pid in "${candidates[@]}"; do
+        value=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' |
+            sed -n 's/^DISPLAY=//p' | head -n1)
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+if [ "$original_wayland" = "$display" ] && [ -n "${DISPLAY:-}" ]; then
+    : # Already inside gamescope; keep its Xwayland display.
+elif gamescope_display=$(steam_display); then
+    export DISPLAY="$gamescope_display"
+else
+    # Do not leak niri's DISPLAY into the game session.
+    unset DISPLAY
+fi
+
+# Render games started from this command on the RTX 3050.  gamescope itself
+# keeps compositing on the AMD iGPU and owns the HDR output.
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export DXVK_HDR=1
+export PROTON_ENABLE_HDR=1
+export ENABLE_GAMESCOPE_WSI=1
+export STEAM_GAMESCOPE_HDR_SUPPORTED=1
+
+exec "$@"

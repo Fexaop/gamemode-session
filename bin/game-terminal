@@ -1,0 +1,27 @@
+#!/bin/bash
+# Open a terminal inside the tty2 gamescope session.
+#
+# Run this from niri, or launch the "Game Terminal" shortcut in Steam Big
+# Picture on tty2.  From that shell you can start Bloodborne directly:
+#
+#     bloodborne-gamescope --play
+#
+# For a shell you can also drive from niri, start tmux inside this terminal:
+#
+#     tmux new -s game
+#
+# then from niri:
+#
+#     tmux attach -t game
+#
+# The tmux session keeps the tty2 environment, so games launched from the
+# niri-attached client still appear in gamescope.
+set -u
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# foot requires wl_subcompositor, which gamescope does not expose.  kitty
+# works both through gamescope's Wayland socket and its Xwayland server.
+exec "$script_dir/game-exec" kitty --single-instance=no \
+    --class=game-terminal --title="Game Terminal" --start-as=fullscreen \
+    "${SHELL:-/bin/bash}" -l
